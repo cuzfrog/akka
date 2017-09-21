@@ -574,3 +574,96 @@ import akka.util.OptionVal
     (stageLogic, promise.future)
   }
 }
+
+/**
+ * INTERNAL API
+ */
+@InternalApi final private[stream] class DynamicSink[T, M](
+  sinkFactory: T ⇒ Sink[T, M],
+  zeroMat:     () ⇒ M) extends GraphStageWithMaterializedValue[SinkShape[T], Future[M]] {
+
+  val in: Inlet[T] = Inlet[T]("dynamicSink.in")
+  override def initialAttributes: Attributes = DefaultAttributes.dynamicSink
+  override val shape: SinkShape[T] = SinkShape.of(in)
+
+  override def toString: String = "DynamicSink"
+
+  override def createLogicAndMaterializedValue(inheritedAttributes: Attributes): (GraphStageLogic, Future[M]) = {
+    lazy val decider = inheritedAttributes.get[SupervisionStrategy].map(_.decider).getOrElse(stoppingDecider)
+    val promise = Promise[M]()
+
+    val graphStageLogic = new GraphStageLogic(shape) {
+      override def preStart(): Unit = pull(in)
+
+      val awaitingElementHandler = new InHandler {
+        override def onPush(): Unit = try {
+          val element = grab(in)
+          val innerSource = createInnerSource(element)
+          val innerSink = sinkFactory(element)
+          Source.fromGraph(innerSource.source).runWith(innerSink)(subFusingMaterializer)
+        } catch {
+          case NonFatal(e) ⇒ decider(e) match {
+            case Supervision.Stop ⇒ failure(e)
+            case _                ⇒ pull(in)
+          }
+        }
+
+        override def onUpstreamFinish(): Unit = completeStage()
+        override def onUpstreamFailure(ex: Throwable): Unit = failStage(ex)
+      }
+      setHandler(in, awaitingElementHandler)
+
+      private def failure(ex: Throwable): Unit = {
+        failStage(ex)
+        promise.failure(ex)
+      }
+
+      private def createInnerSource[E](element: E): SubSourceOutlet[E] = {
+        val innerSource = new SubSourceOutlet[E]("OneToOneOnDemandSink.innerSource")
+
+        innerSource.setHandler(new OutHandler {
+          override def onPull(): Unit = {
+            innerSource.push(element)
+            innerSource.complete()
+            if (isClosed(in)) {
+              completeStage()
+            } else {
+              pull(in)
+              setHandler(in, awaitingElementHandler)
+            }
+          }
+
+          override def onDownstreamFinish(): Unit = {
+            innerSource.complete()
+            if (isClosed(in)) {
+              completeStage()
+            }
+          }
+        })
+
+        setHandler(in, new InHandler {
+          override def onPush(): Unit = {
+            val illegalStateException = new IllegalStateException("Got a push that we weren't expecting")
+            innerSource.fail(illegalStateException)
+            failStage(illegalStateException)
+          }
+
+          override def onUpstreamFinish(): Unit = {
+            // We don't stop until the inner stream stops.
+            setKeepGoing(true)
+          }
+
+          override def onUpstreamFailure(ex: Throwable): Unit = {
+            innerSource.fail(ex)
+            failStage(ex)
+            promise.tryFailure(ex)
+          }
+        })
+
+        innerSource
+      }
+    }
+
+    (graphStageLogic, promise.future)
+  }
+}

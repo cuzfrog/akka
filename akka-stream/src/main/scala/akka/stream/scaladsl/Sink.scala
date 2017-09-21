@@ -411,4 +411,6 @@ object Sink {
   def lazyInit[T, M](sinkFactory: T ⇒ Future[Sink[T, M]], fallback: () ⇒ M): Sink[T, Future[M]] =
     Sink.fromGraph(new LazySink(sinkFactory, fallback))
 
+  def dynamic[T, M](sinkFactory: T ⇒ Sink[T, M], fallback: () ⇒ M): Sink[T, Future[M]] =
+    Sink.fromGraph(new DynamicSink(sinkFactory, fallback))
 }
